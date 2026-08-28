@@ -216,3 +216,34 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Airflow
+logs/
+airflow.db
+airflow.cfg
+airflow-webserver.pid
+standalone_admin_password.txt
+
+# dbt
+target/
+dbt_packages/
+.user.yml
+
+# DuckDB
+*.duckdb
+*.duckdb.wal
+
+# Data zones — never commit raw pulls
+raw/
+data/raw/
+data/staging/
+*.csv
+*.parquet
+!data/samples/*.csv
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+credentials.json
