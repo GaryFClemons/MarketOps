@@ -1,0 +1,11 @@
+# Extends apache/airflow:3.3.1. Never pin apache-airflow itself here —
+# the image owns that, and re-resolving it breaks the constraint tree.
+
+# Ingestion
+yfinance>=0.2.40
+requests>=2.32.0
+
+# Storage / formats
+duckdb>=1.0.0
+pandas>=2.2.0
+pyarrow>=16.0.0
