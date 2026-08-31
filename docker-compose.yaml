@@ -97,6 +97,10 @@ services:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: airflow
+    # Bound to loopback only — an unqualified "5432:5432" listens on every host
+    # interface, exposing a trivially-credentialed DB to the local network.
+    ports:
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres-db-volume:/var/lib/postgresql/data
     healthcheck:
