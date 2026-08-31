@@ -155,7 +155,7 @@ def ingest_ohlcv_daily():
         # honest state: not success (no data was produced) and not failure (nothing
         # is broken). Marking these as failures would train you to ignore red DAGs.
         if not frames:
-            raise AirflowSkipException(f"No bars returned for {session_date}; market likely closed")
+            raise AirflowSkipException(f"No bars returned for {session_date}; market likely closed due to being a weekend or market holiday")
 
         frame = pd.concat(frames, ignore_index=True)
         # Normalize vendor casing/spacing: "Adj Close" -> "adj_close".
@@ -167,6 +167,9 @@ def ingest_ohlcv_daily():
         # Enforce the pinned schema. reindex adds missing columns as null and drops
         # unexpected ones, so the parquet schema is stable across vendor changes.
         frame = frame.reindex(columns=OHLCV_COLUMNS)
+
+        if (frame["date"] != session_date).any():
+            raise AirflowSkipException(f"{(frame['date'] != session_date).sum()} of 73 unexpected rows for {frame['date'].unique()} in {session_date} partition; the rows being returned are from a different session than requested")
 
         partition = _partition_dir(ctx["data_interval_start"])
         # exist_ok=True keeps a re-run from failing on its own prior directory.
