@@ -28,6 +28,7 @@ from pathlib import Path
 import pendulum
 from airflow.sdk import dag, get_current_context, task
 from airflow.sdk.exceptions import AirflowSkipException
+from airflow.timetables.trigger import CronTriggerTimetable
 
 log = logging.getLogger(__name__)
 
@@ -67,15 +68,14 @@ def _partition_dir(logical_date: pendulum.DateTime) -> Path:
     # cron, Tuesday's run would have an interval starting the previous Saturday,
     # so we would fetch the wrong session date. A daily cron keeps the interval
     # exactly one day wide; non-trading days simply skip.
-    schedule="0 6 * * *",
+    schedule=CronTriggerTimetable("0 6 * * *", timezone="UTC", interval=timedelta(days=1)),
     # Anchors the schedule. Never use a dynamic value such as days_ago() or
     # datetime.now() here — the schedule would shift on every parse.
     start_date=pendulum.datetime(2026, 6, 1, tz="UTC"),
     # Off until the Days 3-4 backfill exercise. Flipping this to True would
     # immediately queue every missed interval since start_date.
     catchup=False,
-    # Serializes runs so a backfill cannot have two runs writing concurrently
-    # and cannot hammer the vendor API in parallel.
+    # Bounds scheduler-created runs only; backfills carry their own limit (default 10).
     max_active_runs=1,
     default_args={
         # Market data APIs fail transiently: rate limits, 5xx, connection resets.
@@ -90,10 +90,11 @@ def _partition_dir(logical_date: pendulum.DateTime) -> Path:
     tags=["ingestion", "raw", "market-data"],
 )
 def ingest_ohlcv_daily():
+    #pool="yfinance" serializes vendor calls since max_active_rns doesnt apply to backfills.
     # execution_timeout bounds a hung HTTP call. Without it a stuck task holds a
     # worker slot indefinitely and blocks the pool — a failed task is recoverable,
     # a hung one silently starves the whole scheduler.
-    @task(execution_timeout=timedelta(minutes=15))
+    @task(pool="yfinance", execution_timeout=timedelta(minutes=15))
     def fetch_ohlcv() -> str:
         # Imported inside the task, not at module top level. Top-level imports of
         # heavy third-party libraries run on every DAG-file parse in the
