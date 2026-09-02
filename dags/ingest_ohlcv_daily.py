@@ -27,7 +27,7 @@ from pathlib import Path
 
 import pendulum
 from airflow.sdk import dag, get_current_context, task
-from airflow.sdk.exceptions import AirflowSkipException
+from airflow.sdk.exceptions import AirflowSkipException, AirflowFailException
 from airflow.timetables.trigger import CronTriggerTimetable
 
 log = logging.getLogger(__name__)
@@ -62,27 +62,31 @@ def _partition_dir(logical_date: pendulum.DateTime) -> Path:
     dag_id="ingest_ohlcv_daily",
     description="Pull daily OHLCV bars for the configured tickers into raw/ohlcv/dt=YYYY-MM-DD/",
     # Runs every day at 06:00 UTC, after the US session has settled.
-    #
     # Why daily rather than a weekdays-only "0 6 * * 2-6" cron: Airflow derives
     # data_interval_start from the *previous* scheduled fire time. Under a Tue-Sat
     # cron, Tuesday's run would have an interval starting the previous Saturday,
     # so we would fetch the wrong session date. A daily cron keeps the interval
     # exactly one day wide; non-trading days simply skip.
     schedule=CronTriggerTimetable("0 6 * * *", timezone="UTC", interval=timedelta(days=1)),
+
     # Anchors the schedule. Never use a dynamic value such as days_ago() or
     # datetime.now() here — the schedule would shift on every parse.
     start_date=pendulum.datetime(2026, 6, 1, tz="UTC"),
+
     # Off until the Days 3-4 backfill exercise. Flipping this to True would
     # immediately queue every missed interval since start_date.
     catchup=False,
+
     # Bounds scheduler-created runs only; backfills carry their own limit (default 10).
     max_active_runs=1,
     default_args={
+
         # Market data APIs fail transiently: rate limits, 5xx, connection resets.
         # Retries are safe *because* the task is idempotent — this is the payoff
         # for the write-then-rename design below.
-        "retries": 3,
+        "retries": 0,
         "retry_delay": timedelta(minutes=2),
+
         # Backs off 2m, 4m, 8m rather than retrying into an active rate limit.
         "retry_exponential_backoff": True,
         "max_retry_delay": timedelta(minutes=30),
@@ -90,12 +94,13 @@ def _partition_dir(logical_date: pendulum.DateTime) -> Path:
     tags=["ingestion", "raw", "market-data"],
 )
 def ingest_ohlcv_daily():
-    #pool="yfinance" serializes vendor calls since max_active_rns doesnt apply to backfills.
+    #pool="yfinance" serializes vendor calls since max_active_runs doesnt apply to backfills.
     # execution_timeout bounds a hung HTTP call. Without it a stuck task holds a
     # worker slot indefinitely and blocks the pool — a failed task is recoverable,
     # a hung one silently starves the whole scheduler.
     @task(pool="yfinance", execution_timeout=timedelta(minutes=15))
     def fetch_ohlcv() -> str:
+
         # Imported inside the task, not at module top level. Top-level imports of
         # heavy third-party libraries run on every DAG-file parse in the
         # dag-processor, not just at execution time.
@@ -108,6 +113,7 @@ def ingest_ohlcv_daily():
             raise ValueError("TICKERS is empty; set it in .env")
 
         ctx = get_current_context()
+
         # THE critical line for idempotency and backfill. The session date comes
         # from the run's data interval, never from datetime.now(). A run for
         # 2026-06-01 fetches 2026-06-01 whether it executes on time or three
@@ -121,13 +127,14 @@ def ingest_ohlcv_daily():
             # yfinance treats `end` as exclusive, so +1 day yields a single session.
             end=(session_date + timedelta(days=1)).isoformat(),
             group_by="ticker",
-            # Keep both close and adj_close. Adjusted prices are retroactively
+
+            # Keep both close and adj_close. Adjusted prices are retroactively            
             # rewritten by splits and dividends; storing the unadjusted close means
             # we can always reconstruct what the vendor said on the day.
             auto_adjust=False,
             actions=False,
             progress=False,
-            threads=True,
+            threads=False,
         )
 
         # Reshape vendor output (wide, one column block per ticker) into long
@@ -136,6 +143,7 @@ def ingest_ohlcv_daily():
         # changed in pandas 2.1 and again in 3.0; slicing is version-stable.
         frames = []
         for ticker in TICKERS:
+
             # yfinance returns flat columns for a single ticker, MultiIndex for many.
             if isinstance(raw.columns, pd.MultiIndex):
                 # A delisted or misspelled ticker is absent entirely. Skip it here
@@ -162,15 +170,30 @@ def ingest_ohlcv_daily():
         # Normalize vendor casing/spacing: "Adj Close" -> "adj_close".
         frame.columns = [str(c).strip().lower().replace(" ", "_") for c in frame.columns]
         frame = frame.rename(columns={"index": "date", "datetime": "date"})
+
         # Store a plain date, not a timestamp. The bar's grain is one day; keeping
         # a tz-aware midnight timestamp invites off-by-one joins across timezones.
         frame["date"] = pd.to_datetime(frame["date"]).dt.date
+
         # Enforce the pinned schema. reindex adds missing columns as null and drops
         # unexpected ones, so the parquet schema is stable across vendor changes.
         frame = frame.reindex(columns=OHLCV_COLUMNS)
+        
+        # Validate that the vendor returned the requested session date. Skip and succeed if all dates are mismatched (weekend/holiday) but fail if only some are mismatched (Vendor issue).
+        mismatched = frame["date"] != session_date
+        if mismatched.all():
+            raise AirflowSkipException(f"All rows returned have a mismatched date; {session_date} was requested but {frame['date'].unique()} is being returned instead. market likely closed due to being a weekend or market holiday")
+        elif mismatched.any():
+            raise AirflowFailException(f"{mismatched.sum()} of {len(frame)} rows returned have a mismatched date. Mismatched tickers:{frame.loc[mismatched, 'ticker'].unique()}")
 
-        if (frame["date"] != session_date).any():
-            raise AirflowSkipException(f"{(frame['date'] != session_date).sum()} of 73 unexpected rows for {frame['date'].unique()} in {session_date} partition; the rows being returned are from a different session than requested")
+        #validate that all requested tickers were returned from vendor. fail if missing ticker percentage >= 15%, alert otherwise.
+        missing = set(TICKERS) - set(frame["ticker"].unique())
+        if len(missing) > 0:
+            count_missing = len(missing)
+            percent_missing = (100 * count_missing) / len(TICKERS)
+            log.warning(f"{percent_missing:.1f}% of requested tickers ({count_missing} of {len(TICKERS)}) are missing from the vendor response. missing tickers: {missing}")
+            if percent_missing >= 15:
+                raise ValueError(f"{percent_missing:.1f}% of requested tickers are missing ({count_missing} of {len(TICKERS)}) from the vendor response. missing tickers: {missing}")
 
         partition = _partition_dir(ctx["data_interval_start"])
         # exist_ok=True keeps a re-run from failing on its own prior directory.
@@ -210,14 +233,22 @@ def ingest_ohlcv_daily():
 
         if frame.empty:
             raise ValueError(f"{path} is empty")
+        
+        #Validate the file on disk to make sure partition date and the row dates within are matching.
+        part_date = Path(path).parent.name.removeprefix("dt=")
+        mismatch = frame["date"].astype(str) != part_date
+        if mismatch.any():
+            raise AirflowFailException(f"Partition date is for {part_date} but dates for {mismatch.sum()} of {len(frame)} rows are mismatched: {frame.loc[mismatch, 'date'].unique()}")
 
-        # Warn, don't fail. One delisted ticker should not block the other 19 from
-        # reaching the warehouse. Escalate to an error only if the business decides
-        # a complete universe is a hard requirement.
-        missing = set(TICKERS) - set(frame["ticker"])
-        if missing:
-            log.warning("Tickers absent from partition: %s", sorted(missing))
-
+        #validate the file on disk to make sure all requested tickers are present. fail if missing ticker percentage >= 15%.
+        missing = set(TICKERS) - set(frame["ticker"].unique())
+        if len(missing) > 0:
+            count_missing = len(missing)
+            percent_missing = (100 * count_missing) / len(TICKERS)
+            log.warning(f"{percent_missing:.1f}% of requested tickers ({count_missing} of {len(TICKERS)}) are missing from the partition. missing tickers: {missing}")
+            if percent_missing >= 15:
+                raise ValueError(f"{percent_missing:.1f}% of requested tickers are missing ({count_missing} of {len(TICKERS)}) from the partition. missing tickers: {missing}")
+            
         # (date, ticker) is the declared grain of this table. A duplicate means the
         # reshape logic double-counted, which would silently inflate every
         # downstream aggregate — exactly the failure mode that produces a "the
