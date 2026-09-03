@@ -26,20 +26,13 @@ from datetime import timedelta
 from pathlib import Path
 
 import pendulum
-from airflow.sdk import dag, get_current_context, task
+from airflow.sdk import Variable, BaseHook, dag, get_current_context, task
 from airflow.sdk.exceptions import AirflowSkipException, AirflowFailException
 from airflow.timetables.trigger import CronTriggerTimetable
 
 log = logging.getLogger(__name__)
 
-# Read at module scope because these are cheap process-local env lookups.
-# Deliberately NOT airflow.models.Variable.get() — the DAG file is re-parsed by
-# the dag-processor every ~30s, and a top-level Variable.get() would issue a
-# metadata-DB query on every parse for every DAG. That is the single most common
-# cause of a slow scheduler. Variables are safe *inside* a task body only.
 RAW_ROOT = Path(os.getenv("RAW_ZONE_PATH", "/opt/airflow/data/raw"))
-TICKERS = [t.strip().upper() for t in os.getenv("TICKERS", "").split(",") if t.strip()]
-
 # Fixed column order pinned here rather than inferred from the vendor response.
 # If yfinance adds, removes, or reorders a column, the reindex below normalizes
 # it instead of silently changing the parquet schema under downstream readers.
@@ -107,10 +100,17 @@ def ingest_ohlcv_daily():
         import pandas as pd
         import yfinance as yf
 
+        # Both reads happen here rather than at module scope: in Airflow 3 task
+        # code has no DB access and resolves these over the Task Execution API,
+        # so a top-level read would cost the dag-processor a round trip per parse.
+        tickers = Variable.get("tickers", deserialize_json=True)   
+        conn = BaseHook.get_connection("polygon_default")
+        base_url = f"{conn.schema}://{conn.host}"
+
         # Fail loudly at the boundary rather than writing an empty partition that
         # looks like "market closed" to every downstream consumer.
-        if not TICKERS:
-            raise ValueError("TICKERS is empty; set it in .env")
+        if not tickers:
+            raise ValueError("tickers is empty")
 
         ctx = get_current_context()
 
@@ -122,7 +122,7 @@ def ingest_ohlcv_daily():
         session_date = ctx["data_interval_start"].date()
 
         raw = yf.download(
-            TICKERS,
+            tickers,
             start=session_date.isoformat(),
             # yfinance treats `end` as exclusive, so +1 day yields a single session.
             end=(session_date + timedelta(days=1)).isoformat(),
@@ -142,7 +142,7 @@ def ingest_ohlcv_daily():
         # rather than DataFrame.stack() because stack()'s MultiIndex semantics
         # changed in pandas 2.1 and again in 3.0; slicing is version-stable.
         frames = []
-        for ticker in TICKERS:
+        for ticker in tickers:
 
             # yfinance returns flat columns for a single ticker, MultiIndex for many.
             if isinstance(raw.columns, pd.MultiIndex):
@@ -187,13 +187,13 @@ def ingest_ohlcv_daily():
             raise AirflowFailException(f"{mismatched.sum()} of {len(frame)} rows returned have a mismatched date. Mismatched tickers:{frame.loc[mismatched, 'ticker'].unique()}")
 
         #validate that all requested tickers were returned from vendor. fail if missing ticker percentage >= 15%, alert otherwise.
-        missing = set(TICKERS) - set(frame["ticker"].unique())
+        missing = set(tickers) - set(frame["ticker"].unique())
         if len(missing) > 0:
             count_missing = len(missing)
-            percent_missing = (100 * count_missing) / len(TICKERS)
-            log.warning(f"{percent_missing:.1f}% of requested tickers ({count_missing} of {len(TICKERS)}) are missing from the vendor response. missing tickers: {missing}")
+            percent_missing = (100 * count_missing) / len(tickers)
+            log.warning(f"{percent_missing:.1f}% of requested tickers ({count_missing} of {len(tickers)}) are missing from the vendor response. missing tickers: {missing}")
             if percent_missing >= 15:
-                raise ValueError(f"{percent_missing:.1f}% of requested tickers are missing ({count_missing} of {len(TICKERS)}) from the vendor response. missing tickers: {missing}")
+                raise ValueError(f"{percent_missing:.1f}% of requested tickers are missing ({count_missing} of {len(tickers)}) from the vendor response. missing tickers: {missing}")
 
         partition = _partition_dir(ctx["data_interval_start"])
         # exist_ok=True keeps a re-run from failing on its own prior directory.
@@ -220,7 +220,8 @@ def ingest_ohlcv_daily():
 
     @task
     def validate_partition(path: str) -> None:
-        """Gate the partition before anything downstream trusts it.
+        """
+        validate the artifact.
 
         Kept as a separate task so a data-quality failure surfaces as its own red
         node in the UI. Folding these checks into fetch_ohlcv would make "the API
@@ -239,15 +240,6 @@ def ingest_ohlcv_daily():
         mismatch = frame["date"].astype(str) != part_date
         if mismatch.any():
             raise AirflowFailException(f"Partition date is for {part_date} but dates for {mismatch.sum()} of {len(frame)} rows are mismatched: {frame.loc[mismatch, 'date'].unique()}")
-
-        #validate the file on disk to make sure all requested tickers are present. fail if missing ticker percentage >= 15%.
-        missing = set(TICKERS) - set(frame["ticker"].unique())
-        if len(missing) > 0:
-            count_missing = len(missing)
-            percent_missing = (100 * count_missing) / len(TICKERS)
-            log.warning(f"{percent_missing:.1f}% of requested tickers ({count_missing} of {len(TICKERS)}) are missing from the partition. missing tickers: {missing}")
-            if percent_missing >= 15:
-                raise ValueError(f"{percent_missing:.1f}% of requested tickers are missing ({count_missing} of {len(TICKERS)}) from the partition. missing tickers: {missing}")
             
         # (date, ticker) is the declared grain of this table. A duplicate means the
         # reshape logic double-counted, which would silently inflate every

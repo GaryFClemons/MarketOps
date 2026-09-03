@@ -247,3 +247,6 @@ data/staging/
 !.env.example
 *.pem
 credentials.json
+
+#Miscellaneous
+scratch/
