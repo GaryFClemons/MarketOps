@@ -29,14 +29,15 @@ import pendulum
 from airflow.sdk import Variable, BaseHook, dag, get_current_context, task
 from airflow.sdk.exceptions import AirflowSkipException, AirflowFailException
 from airflow.timetables.trigger import CronTriggerTimetable
+import requests
 
 log = logging.getLogger(__name__)
 
 RAW_ROOT = Path(os.getenv("RAW_ZONE_PATH", "/opt/airflow/data/raw"))
 # Fixed column order pinned here rather than inferred from the vendor response.
-# If yfinance adds, removes, or reorders a column, the reindex below normalizes
+# If vendor adds, removes, or reorders a column, the reindex below normalizes
 # it instead of silently changing the parquet schema under downstream readers.
-OHLCV_COLUMNS = ["date", "ticker", "open", "high", "low", "close", "adj_close", "volume"]
+OHLCV_COLUMNS = ["date", "ticker", "open", "high", "low", "close", "volume", "vwap", "trade_count"]
 
 
 def _partition_dir(logical_date: pendulum.DateTime) -> Path:
@@ -77,7 +78,7 @@ def _partition_dir(logical_date: pendulum.DateTime) -> Path:
         # Market data APIs fail transiently: rate limits, 5xx, connection resets.
         # Retries are safe *because* the task is idempotent — this is the payoff
         # for the write-then-rename design below.
-        "retries": 0,
+        "retries": 3,
         "retry_delay": timedelta(minutes=2),
 
         # Backs off 2m, 4m, 8m rather than retrying into an active rate limit.
@@ -87,18 +88,17 @@ def _partition_dir(logical_date: pendulum.DateTime) -> Path:
     tags=["ingestion", "raw", "market-data"],
 )
 def ingest_ohlcv_daily():
-    #pool="yfinance" serializes vendor calls since max_active_runs doesnt apply to backfills.
+    #pool="polygon" serializes vendor calls since max_active_runs doesnt apply to backfills.
     # execution_timeout bounds a hung HTTP call. Without it a stuck task holds a
     # worker slot indefinitely and blocks the pool — a failed task is recoverable,
     # a hung one silently starves the whole scheduler.
-    @task(pool="yfinance", execution_timeout=timedelta(minutes=15))
+    @task(pool="polygon", execution_timeout=timedelta(minutes=15))
     def fetch_ohlcv() -> str:
 
         # Imported inside the task, not at module top level. Top-level imports of
         # heavy third-party libraries run on every DAG-file parse in the
         # dag-processor, not just at execution time.
         import pandas as pd
-        import yfinance as yf
 
         # Both reads happen here rather than at module scope: in Airflow 3 task
         # code has no DB access and resolves these over the Task Execution API,
@@ -121,81 +121,69 @@ def ingest_ohlcv_daily():
         # its interval.
         session_date = ctx["data_interval_start"].date()
 
-        raw = yf.download(
-            tickers,
-            start=session_date.isoformat(),
-            # yfinance treats `end` as exclusive, so +1 day yields a single session.
-            end=(session_date + timedelta(days=1)).isoformat(),
-            group_by="ticker",
+        #Create url, params, and headers for the api request to the vendor. Session date is passed in the url path to ensure that the correct date is returned from the vendor.
+        url = f"{base_url}/v2/aggs/grouped/locale/us/market/stocks/{session_date}"
+        params = {"adjusted": "false"}
+        headers = {"Authorization": f"Bearer {conn.password}"}
 
-            # Keep both close and adj_close. Adjusted prices are retroactively            
-            # rewritten by splits and dividends; storing the unadjusted close means
-            # we can always reconstruct what the vendor said on the day.
-            auto_adjust=False,
-            actions=False,
-            progress=False,
-            threads=False,
-        )
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        response_code = response.status_code
 
-        # Reshape vendor output (wide, one column block per ticker) into long
-        # format (one row per date/ticker). Done with explicit column slicing
-        # rather than DataFrame.stack() because stack()'s MultiIndex semantics
-        # changed in pandas 2.1 and again in 3.0; slicing is version-stable.
-        frames = []
-        for ticker in tickers:
+        #Validate the status code recieved from the vendors response
+        if response_code in [401, 403]:
+            raise AirflowFailException(f"Response code {response_code}; Authentication/Permission Issue")
 
-            # yfinance returns flat columns for a single ticker, MultiIndex for many.
-            if isinstance(raw.columns, pd.MultiIndex):
-                # A delisted or misspelled ticker is absent entirely. Skip it here
-                # and let validate_partition report it, so one bad symbol cannot
-                # fail the whole batch.
-                if ticker not in raw.columns.get_level_values(0):
-                    continue
-                sub = raw[ticker]
-            else:
-                sub = raw
-            sub = sub.dropna(how="all").reset_index()
-            if sub.empty:
-                continue
-            sub["ticker"] = ticker
-            frames.append(sub)
+        elif response_code == 429:
+            raise requests.HTTPError(f"Response code {response_code}; retrying")
+        
+        elif 500 <= response_code < 600:
+            raise requests.HTTPError(f"Response code {response_code}; retrying")
 
-        # Weekends and market holidays legitimately return nothing. Skipped is the
-        # honest state: not success (no data was produced) and not failure (nothing
-        # is broken). Marking these as failures would train you to ignore red DAGs.
-        if not frames:
+        else:
+            if response_code != 200:
+                raise AirflowFailException(f"Response code {response_code}; Unexpected error, check the vendor's status page or try again later.")
+
+        payload = response.json()
+        results = payload["results"]
+
+        #Validate that the json payload is not empty, and contains a reasonable number of tickers in the "results" key (>12,000 tickers expected so less than 80000 is very unusual). Skip if empty (market holiday/weekend likely); Fail if less than 8000.
+        if not results:
             raise AirflowSkipException(f"No bars returned for {session_date}; market likely closed due to being a weekend or market holiday")
 
-        frame = pd.concat(frames, ignore_index=True)
-        # Normalize vendor casing/spacing: "Adj Close" -> "adj_close".
-        frame.columns = [str(c).strip().lower().replace(" ", "_") for c in frame.columns]
-        frame = frame.rename(columns={"index": "date", "datetime": "date"})
+        if len(results) < 8000:
+            raise AirflowFailException(f"Vendor returned {len(results)} rows; Possible vendor issue, Check the vendor's status page or try again later.")
 
-        # Store a plain date, not a timestamp. The bar's grain is one day; keeping
-        # a tz-aware midnight timestamp invites off-by-one joins across timezones.
-        frame["date"] = pd.to_datetime(frame["date"]).dt.date
+        #convert vendor json response to pandas dataframe, contains all tickers from the market.  
+        df_market = pd.DataFrame(results)
+
+        #filter df_market for rows where "T" is in our tickerlist, 
+        df_tick = df_market[df_market['T'].isin(tickers)].copy()
+
+        # Rename vendor columns
+        df_tick = df_tick.rename(columns={"T": "ticker", "v": "volume", "vw":"vwap","o":"open","c":"close","h":"high","l":"low","t": "date", "n":"trade_count"})
+
+        #validate that the date in every row matches session_date. Fail if there are any mismatches.
+        df_tick["date"] = pd.to_datetime(df_tick["date"], unit="ms").dt.date
+        mismatched = df_tick["date"] != session_date
+        if mismatched.any():
+            mismatches = df_tick.loc[mismatched, ["date","ticker"]].drop_duplicates()
+            raise AirflowFailException(f"Some rows returned have a mismatched date; {session_date} was requested but below dates are being returned instead: {mismatches}")
 
         # Enforce the pinned schema. reindex adds missing columns as null and drops
         # unexpected ones, so the parquet schema is stable across vendor changes.
-        frame = frame.reindex(columns=OHLCV_COLUMNS)
+        df_tick = df_tick.reindex(columns=OHLCV_COLUMNS)
         
-        # Validate that the vendor returned the requested session date. Skip and succeed if all dates are mismatched (weekend/holiday) but fail if only some are mismatched (Vendor issue).
-        mismatched = frame["date"] != session_date
-        if mismatched.all():
-            raise AirflowSkipException(f"All rows returned have a mismatched date; {session_date} was requested but {frame['date'].unique()} is being returned instead. market likely closed due to being a weekend or market holiday")
-        elif mismatched.any():
-            raise AirflowFailException(f"{mismatched.sum()} of {len(frame)} rows returned have a mismatched date. Mismatched tickers:{frame.loc[mismatched, 'ticker'].unique()}")
-
-        #validate that all requested tickers were returned from vendor. fail if missing ticker percentage >= 15%, alert otherwise.
-        missing = set(tickers) - set(frame["ticker"].unique())
+        #validate that all requested tickers were returned from vendor. fail if missing ticker percentage >= 20%, alert otherwise.
+        missing = set(tickers) - set(df_tick["ticker"].unique())
         if len(missing) > 0:
             count_missing = len(missing)
             percent_missing = (100 * count_missing) / len(tickers)
             log.warning(f"{percent_missing:.1f}% of requested tickers ({count_missing} of {len(tickers)}) are missing from the vendor response. missing tickers: {missing}")
-            if percent_missing >= 15:
+            if percent_missing >= 20:
                 raise ValueError(f"{percent_missing:.1f}% of requested tickers are missing ({count_missing} of {len(tickers)}) from the vendor response. missing tickers: {missing}")
 
         partition = _partition_dir(ctx["data_interval_start"])
+
         # exist_ok=True keeps a re-run from failing on its own prior directory.
         partition.mkdir(parents=True, exist_ok=True)
         target = partition / "ohlcv.parquet"
@@ -209,10 +197,10 @@ def ingest_ohlcv_daily():
         #      appending, so N runs of the same interval yield one partition.
         # This is why the retry policy above is safe to be aggressive.
         staging = target.with_suffix(".parquet.tmp")
-        frame.to_parquet(staging, index=False)
+        df_tick.to_parquet(staging, index=False)
         staging.replace(target)
 
-        log.info("Wrote %s rows for %s tickers to %s", len(frame), frame["ticker"].nunique(), target)
+        log.info("Wrote %s rows for %s tickers to %s", len(df_tick), df_tick["ticker"].nunique(), target)
         # Return the path, not the DataFrame. TaskFlow return values become XComs,
         # which are stored in the Airflow metadata DB — a small string reference is
         # appropriate, a serialized DataFrame is the classic XCom antipattern.
@@ -230,31 +218,32 @@ def ingest_ohlcv_daily():
         """
         import pandas as pd
 
-        frame = pd.read_parquet(path)
+        df_part = pd.read_parquet(path)
 
-        if frame.empty:
+        if df_part.empty:
             raise ValueError(f"{path} is empty")
         
         #Validate the file on disk to make sure partition date and the row dates within are matching.
         part_date = Path(path).parent.name.removeprefix("dt=")
-        mismatch = frame["date"].astype(str) != part_date
+        mismatch = df_part["date"].astype(str) != part_date
         if mismatch.any():
-            raise AirflowFailException(f"Partition date is for {part_date} but dates for {mismatch.sum()} of {len(frame)} rows are mismatched: {frame.loc[mismatch, 'date'].unique()}")
+            mismatches = df_part.loc[mismatch, 'date'].unique()
+            raise AirflowFailException(f"Partition date is for {part_date} but dates for {mismatch.sum()} of {len(df_part)} rows are mismatched: {mismatches}")
             
         # (date, ticker) is the declared grain of this table. A duplicate means the
         # reshape logic double-counted, which would silently inflate every
         # downstream aggregate — exactly the failure mode that produces a "the
         # numbers look wrong" ticket weeks later.
-        duplicates = frame.duplicated(subset=["date", "ticker"]).sum()
+        duplicates = df_part.duplicated(subset=["date", "ticker"]).sum()
         if duplicates:
             raise ValueError(f"{duplicates} duplicate (date, ticker) rows in {path}")
 
         # close is the one column with no valid reason to be null on a trading day.
-        nulls = frame["close"].isna().sum()
+        nulls = df_part["close"].isna().sum()
         if nulls:
             raise ValueError(f"{nulls} rows with null close in {path}")
 
-        log.info("Validated %s rows across %s tickers", len(frame), frame["ticker"].nunique())
+        log.info("Validated %s rows across %s tickers", len(df_part), df_part["ticker"].nunique())
 
     # Passing the return value establishes the dependency implicitly. Under the
     # TaskFlow API this is both the data flow (the XCom'd path) and the execution

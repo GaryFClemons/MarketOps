@@ -2,7 +2,6 @@
 # the image owns that, and re-resolving it breaks the constraint tree.
 
 # Ingestion
-yfinance>=0.2.40
 requests>=2.32.0
 
 # Storage / formats
