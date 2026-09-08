@@ -4,11 +4,6 @@
         "include_deferred": false,
         "slots": 128
     },
-    "yfinance": {
-        "description": "Serialize outbound calls to the yfinance API",
-        "include_deferred": false,
-        "slots": 1
-    },
     "polygon": {
         "description": "Serialize outbound calls to the polygon API",
         "include_deferred": false,
