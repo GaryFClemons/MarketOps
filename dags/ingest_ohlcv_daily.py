@@ -30,6 +30,7 @@ from airflow.sdk import Variable, BaseHook, dag, get_current_context, task
 from airflow.sdk.exceptions import AirflowSkipException, AirflowFailException
 from airflow.timetables.trigger import CronTriggerTimetable
 import requests
+import time
 
 log = logging.getLogger(__name__)
 
@@ -38,7 +39,8 @@ RAW_ROOT = Path(os.getenv("RAW_ZONE_PATH", "/opt/airflow/data/raw"))
 # If vendor adds, removes, or reorders a column, the reindex below normalizes
 # it instead of silently changing the parquet schema under downstream readers.
 OHLCV_COLUMNS = ["date", "ticker", "open", "high", "low", "close", "volume", "vwap", "trade_count"]
-
+MAX_THROTTLE_WAITS = 5
+MAX_WAIT_SECONDS = 90
 
 def _partition_dir(logical_date: pendulum.DateTime) -> Path:
     """Hive-style partition path: raw/ohlcv/dt=2026-08-26/.
@@ -69,7 +71,7 @@ def _partition_dir(logical_date: pendulum.DateTime) -> Path:
 
     # Off until the Days 3-4 backfill exercise. Flipping this to True would
     # immediately queue every missed interval since start_date.
-    catchup=False,
+    catchup=True,
 
     # Bounds scheduler-created runs only; backfills carry their own limit (default 10).
     max_active_runs=1,
@@ -126,15 +128,22 @@ def ingest_ohlcv_daily():
         params = {"adjusted": "false"}
         headers = {"Authorization": f"Bearer {conn.password}"}
 
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        response_code = response.status_code
+        for attempt in range(MAX_THROTTLE_WAITS + 1):
+            response = requests.get(url, headers=headers, params=params, timeout=10)
+            response_code = response.status_code
+            if response_code != 429:
+                break
+            if attempt == MAX_THROTTLE_WAITS:
+                raise requests.HTTPError(f"Response code 429 after {MAX_THROTTLE_WAITS} in-task waits; retrying")
+
+            retry_after = response.headers.get("Retry-After", "")
+            wait = min(int(retry_after) if retry_after.isdigit() else 60, MAX_WAIT_SECONDS)
+            log.warning("Throttled by vendor; sleeping %ss before attempt %s", wait, attempt + 2)
+            time.sleep(wait)
 
         #Validate the status code recieved from the vendors response
         if response_code in [401, 403]:
             raise AirflowFailException(f"Response code {response_code}; Authentication/Permission Issue")
-
-        elif response_code == 429:
-            raise requests.HTTPError(f"Response code {response_code}; retrying")
         
         elif 500 <= response_code < 600:
             raise requests.HTTPError(f"Response code {response_code}; retrying")
@@ -144,7 +153,7 @@ def ingest_ohlcv_daily():
                 raise AirflowFailException(f"Response code {response_code}; Unexpected error, check the vendor's status page or try again later.")
 
         payload = response.json()
-        results = payload["results"]
+        results = payload.get("results")
 
         #Validate that the json payload is not empty, and contains a reasonable number of tickers in the "results" key (>12,000 tickers expected so less than 80000 is very unusual). Skip if empty (market holiday/weekend likely); Fail if less than 8000.
         if not results:
