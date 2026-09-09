@@ -69,7 +69,7 @@ def _partition_dir(logical_date: pendulum.DateTime) -> Path:
 
     # Off until the Days 3-4 backfill exercise. Flipping this to True would
     # immediately queue every missed interval since start_date.
-    catchup=False,
+    catchup=True,
 
     # Bounds scheduler-created runs only; backfills carry their own limit (default 10).
     max_active_runs=1,
@@ -144,7 +144,7 @@ def ingest_ohlcv_daily():
                 raise AirflowFailException(f"Response code {response_code}; Unexpected error, check the vendor's status page or try again later.")
 
         payload = response.json()
-        results = payload["results"]
+        results = payload.get("results")
 
         #Validate that the json payload is not empty, and contains a reasonable number of tickers in the "results" key (>12,000 tickers expected so less than 80000 is very unusual). Skip if empty (market holiday/weekend likely); Fail if less than 8000.
         if not results:
