@@ -1,0 +1,17 @@
+# Host-side development: tests, the agent CLI, evals.
+# The Airflow image does NOT install this file — it installs requirements.txt.
+-r requirements.txt
+
+pytest>=8.0
+
+# The agent's contracts. Already present in the Airflow image as an Airflow
+# dependency; listed so a fresh host venv without Airflow still works.
+pydantic>=2.7
+numpy>=1.26
+
+# --- Uncomment when implementing the matching TODO ---
+# LLM provider SDKs — install the one LLM_PROVIDER points at (agent/providers.py).
+# anthropic
+# openai
+# dbt over the local DuckDB warehouse (dbt/).
+# dbt-duckdb

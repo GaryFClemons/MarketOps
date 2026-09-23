@@ -1,0 +1,70 @@
+{
+  "_comment": "Offline demo transcript for the demo-signal (python -m market_ops.agent demo-signal). Cites only signal:<id>, so it validates regardless of how the corpus is chunked.",
+  "signal_id": "b101d2cad2508c70",
+  "responses": [
+    {
+      "model": "scripted",
+      "text": "Searching the runbooks for the 401 failure mode.",
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "name": "search_docs",
+          "arguments": {
+            "query": "401 AirflowFailException polygon_default",
+            "k": 5
+          }
+        }
+      ],
+      "stop_reason": "tool_use",
+      "usage": {
+        "input_tokens": 1800,
+        "output_tokens": 60
+      }
+    },
+    {
+      "model": "scripted",
+      "text": "",
+      "tool_calls": [
+        {
+          "id": "call_2",
+          "name": "submit_brief",
+          "arguments": {
+            "signal_id": "b101d2cad2508c70",
+            "title": "fetch_ohlcv rejected by Polygon with 401: check Connection polygon_default",
+            "severity": "high",
+            "summary": "fetch_ohlcv failed on its first try with a 401 from Polygon. The DAG treats 401/403 as deterministic and does not retry, so the session's partition was not written.",
+            "probable_cause": "The API key stored in Connection polygon_default was rejected by the vendor (invalid, expired, or revoked).",
+            "cause_confidence": "confirmed",
+            "evidence": [
+              {
+                "source": "run_metadata",
+                "ref": "signal:b101d2cad2508c70",
+                "quote": "Response code 401; Authentication/Permission Issue"
+              }
+            ],
+            "recommended_actions": [
+              {
+                "kind": "investigate",
+                "step": "Confirm which key is in use: airflow connections get polygon_default (the password prints masked)."
+              },
+              {
+                "kind": "config_change",
+                "step": "Rotate the Polygon API key in Connection polygon_default."
+              },
+              {
+                "kind": "rerun",
+                "step": "Clear fetch_ohlcv for this run after the key is fixed."
+              }
+            ],
+            "requires_human": true
+          }
+        }
+      ],
+      "stop_reason": "tool_use",
+      "usage": {
+        "input_tokens": 3100,
+        "output_tokens": 420
+      }
+    }
+  ]
+}

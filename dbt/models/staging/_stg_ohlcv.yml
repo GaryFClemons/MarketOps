@@ -1,0 +1,16 @@
+version: 2
+
+models:
+  - name: stg_ohlcv
+    description: "Grain: one row per (session_date, ticker). The raw zone, typed."
+    data_tests:
+      - unique_combination:
+          columns: ["session_date", "ticker"]
+    columns:
+      - name: session_date
+        data_tests: [not_null]
+      - name: ticker
+        data_tests: [not_null]
+      - name: close
+        description: "No valid reason to be null on a trading day."
+        data_tests: [not_null]

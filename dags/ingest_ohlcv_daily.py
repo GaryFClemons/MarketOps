@@ -69,7 +69,6 @@ def _partition_dir(logical_date: pendulum.DateTime) -> Path:
     # datetime.now() here — the schedule would shift on every parse.
     start_date=pendulum.datetime(2026, 6, 1, tz="UTC"),
 
-    # Off until the Days 3-4 backfill exercise. Flipping this to True would
     # immediately queue every missed interval since start_date.
     catchup=True,
 

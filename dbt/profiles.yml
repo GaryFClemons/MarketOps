@@ -1,0 +1,14 @@
+# .env.example sets DBT_PROFILES_DIR=./dbt, so this file is found without flags
+# once .env is loaded. On the host .env is not loaded, so the defaults apply.
+market_ops:
+  target: "{{ env_var('DBT_TARGET', 'dev') }}"
+  outputs:
+    dev:
+      type: duckdb
+      # DUCKDB_PATH in .env.example is the container path. The host default is
+      # relative to the repo root; create data/warehouse/ first (DuckDB creates
+      # the file, not the directory). *.duckdb is gitignored.
+      path: "{{ env_var('DUCKDB_PATH', 'data/warehouse/marketops.duckdb') }}"
+      # DuckDB allows one writer per database file; parallel model builds would
+      # contend for it.
+      threads: 1
