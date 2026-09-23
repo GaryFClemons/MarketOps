@@ -1,0 +1,20 @@
+version: 2
+
+sources:
+  - name: raw
+    description: >
+      The Hive-partitioned raw zone written by ingest_ohlcv_daily. One parquet
+      file per trading session, landed as close to the vendor's shape as possible.
+    # dbt-duckdb reads external files through `external_location`, which may be a
+    # table function call. Verify the exact syntax against the dbt-duckdb README
+    # for the installed version when this is first built.
+    meta:
+      external_location: "read_parquet('data/raw/ohlcv/dt=*/ohlcv.parquet', hive_partitioning = 1)"
+    tables:
+      - name: ohlcv
+        description: >
+          Grain: one row per (date, ticker). `dt` is the Hive partition column;
+          DuckDB derives it from the directory name, so a filter on `dt` prunes
+          whole files before any are opened.
+        # TODO(owner, later): source freshness. There is no loaded_at column;
+        # max(dt) against the expected last session is the real freshness check.

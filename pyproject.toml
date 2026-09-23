@@ -1,0 +1,18 @@
+# Tool configuration only. The Airflow image installs from requirements.txt; the
+# host dev environment from requirements-dev.txt. market_ops is imported from the
+# repo root (pytest's `pythonpath` below, `python -m` from the root), so there is
+# no package build step to keep in sync.
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+pythonpath = ["."]
+# importlib mode: test files in different folders may share a basename
+# (tests/quality/test_checks.py, tests/agent/test_checks.py) without __init__.py
+# files. -ra prints a reason line for every non-passing test, which is how the
+# scaffold's TODO skips show up as a readable backlog after every run.
+addopts = ["--import-mode=importlib", "-ra"]
+markers = [
+    "airflow: needs apache-airflow importable (host .venv or a container)",
+    "live: calls a real LLM or embedding API; skipped unless MARKETOPS_LIVE=1",
+]

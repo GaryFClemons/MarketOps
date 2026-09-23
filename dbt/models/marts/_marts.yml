@@ -1,0 +1,48 @@
+version: 2
+
+models:
+  - name: fct_daily_bars
+    description: >
+      Grain: one row per (session_date, ticker). Daily OHLCV bars, incremental
+      with a lookback window for re-derived partitions.
+    data_tests:
+      - unique_combination:
+          columns: ["session_date", "ticker"]
+    columns:
+      - name: session_date
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('dim_date')
+              field: calendar_date
+      - name: ticker
+        data_tests:
+          - not_null
+          # TODO(owner, later): restrict to versions valid on session_date once
+          # dim_ticker's validity windows are backdated; a plain relationship
+          # only proves the ticker was ever tracked.
+          - relationships:
+              to: ref('dim_ticker')
+              field: ticker
+      - name: close
+        data_tests: [not_null]
+
+  - name: dim_date
+    description: "Grain: one row per calendar date between the first and last loaded session."
+    columns:
+      - name: calendar_date
+        data_tests: [unique, not_null]
+
+  - name: dim_ticker
+    description: "Grain: one row per version of a ticker's membership (SCD Type 2)."
+    data_tests:
+      - unique_combination:
+          columns: ["ticker", "valid_from"]
+    columns:
+      - name: ticker
+        data_tests: [not_null]
+      - name: is_active
+        data_tests:
+          - accepted_values:
+              values: [true, false]
+              quote: false

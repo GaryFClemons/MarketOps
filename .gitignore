@@ -240,6 +240,8 @@ data/staging/
 *.csv
 *.parquet
 !data/samples/*.csv
+# dbt seeds are small, reviewed reference data and belong in version control.
+!dbt/seeds/*.csv
 
 # Secrets
 .env
@@ -250,3 +252,9 @@ credentials.json
 
 #Miscellaneous
 scratch/
+
+# Generated ops artifacts — alert signals, the agent's audit trail — and raw eval
+# run outputs. The curated eval record lives in docs/eval_results.md instead.
+data/ops/
+data/warehouse/
+evals/results/

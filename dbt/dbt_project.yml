@@ -1,0 +1,26 @@
+# dbt over the local DuckDB warehouse. Run from the repo root:
+#   dbt build --project-dir dbt --profiles-dir dbt
+# Relative paths (the raw-zone glob, the warehouse file) resolve against the
+# directory dbt is launched from, so launch it from the repo root.
+name: market_ops
+version: "0.1.0"
+config-version: 2
+profile: market_ops
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+snapshot-paths: ["snapshots"]
+test-paths: ["tests"]
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+models:
+  market_ops:
+    # Staging is a thin typed view over raw parquet: cheap to rebuild, never
+    # stale, and the raw zone stays the single source of truth.
+    staging:
+      +materialized: view
+    # Marts are what people query; materialize them. fct_daily_bars overrides
+    # this with its own incremental config.
+    marts:
+      +materialized: table
